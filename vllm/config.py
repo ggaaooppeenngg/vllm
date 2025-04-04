@@ -2916,6 +2916,10 @@ class KVTransferConfig(BaseModel):
     # PyNcclConnector, this should be 2.
     kv_parallel_size: int = 1
 
+    kv_producers_size: int = 1
+
+    tensor_parallel_multiplier: int = 1
+
     # The KV connector ip, used to build distributed connection
     kv_ip: str = "127.0.0.1"
 

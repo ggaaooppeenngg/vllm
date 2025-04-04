@@ -39,8 +39,8 @@ class KVLookupBufferBase(ABC):
     """
 
     @abstractmethod
-    def insert(self, input_tokens: torch.Tensor, roi: torch.Tensor,
-               key: torch.Tensor, value: torch.Tensor,
+    def insert(self, target_rank: int, input_tokens: torch.Tensor,
+               roi: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                hidden: torch.Tensor) -> None:
         """Insert into the lookup buffer.
         
@@ -70,7 +70,7 @@ class KVLookupBufferBase(ABC):
 
     @abstractmethod
     def drop_select(
-            self, input_tokens: Optional[torch.Tensor],
+            self, rank: int, input_tokens: Optional[torch.Tensor],
             roi: Optional[torch.Tensor]) -> List[Optional[torch.Tensor]]:
         """Select and *drop* KV cache entries from the lookup buffer.
         

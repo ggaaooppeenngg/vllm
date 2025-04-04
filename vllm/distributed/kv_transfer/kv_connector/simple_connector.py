@@ -14,7 +14,7 @@ import torch
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
-from vllm.config import VllmConfig
+from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.distributed.kv_transfer.kv_lookup_buffer.simple_buffer import (
     SimpleBuffer)
@@ -74,20 +74,36 @@ class SimpleConnector(KVConnectorBase):
         self.producer_signal_pipe: Union[PyNcclPipe, MooncakePipe]
         self.consumer_signal_pipe: Union[PyNcclPipe, MooncakePipe]
 
-        # 2 pipes for every rank in the world
-        port_offset_base = 2 * rank
+        if self.config.kv_rank is None:
+            raise ValueError("kv_rank cannot be None")
+        self.kv_group_rank = self._get_kv_group_rank(self.config.kv_rank, rank,
+                                                     self.config)
+        self.tp_size = config.parallel_config.tensor_parallel_size
 
+        # 2 pipes for every rank in the world
+        if self.config.is_kv_producer:
+            port_offset_base = 2 * rank + 1
+        else:
+            port_offset_base = 2 * (rank //
+                                    self.config.tensor_parallel_multiplier) + 1
+
+        logger.info("rank %d, port_offset_base %d, tpm %d", rank,
+                    port_offset_base, self.config.tensor_parallel_multiplier)
+
+        self.local_kv_rank = rank % self.config.tensor_parallel_multiplier
         # In disaggregated prefill, the prefill vLLM only uses send pipe
         # and the decode vLLM only uses recv pipe
         if self.config.is_kv_producer:
 
             if self.config.kv_connector == "PyNcclConnector":
                 self.producer_data_pipe = PyNcclPipe(
+                    kv_group_rank=self.kv_group_rank,
                     local_rank=local_rank,
                     config=self.config,
                     port_offset=port_offset_base,
                 )
                 self.producer_signal_pipe = PyNcclPipe(
+                    kv_group_rank=self.kv_group_rank,
                     local_rank=local_rank,
                     config=self.config,
                     port_offset=port_offset_base + 1,
@@ -111,11 +127,13 @@ class SimpleConnector(KVConnectorBase):
             # its recv pipe to the send pipe of KV producder
             if self.config.kv_connector == "PyNcclConnector":
                 self.consumer_data_pipe = PyNcclPipe(
+                    kv_group_rank=self.kv_group_rank,
                     local_rank=local_rank,
                     config=self.config,
                     port_offset=port_offset_base,
                 )
                 self.consumer_signal_pipe = PyNcclPipe(
+                    kv_group_rank=self.kv_group_rank,
                     local_rank=local_rank,
                     config=self.config,
                     port_offset=port_offset_base + 1,
@@ -134,21 +152,29 @@ class SimpleConnector(KVConnectorBase):
                 self.config.kv_buffer_size,
             )
 
-    def select(self, input_tokens: Optional[torch.Tensor],
+    def select(self, source_rank: int, input_tokens: Optional[torch.Tensor],
                roi: Optional[torch.Tensor]) -> List[Optional[torch.Tensor]]:
+
+        logger.info("Selecting KV caches and hidden states for source rank %d",
+                    source_rank)
 
         assert self.consumer_buffer is not None, "Please initialize the "\
             "consumer buffer before calling select."
-        return self.consumer_buffer.drop_select(input_tokens, roi)
+        return self.consumer_buffer.drop_select(source_rank, input_tokens, roi)
 
-    def insert(self, input_tokens: torch.Tensor, roi: torch.Tensor,
-               key: torch.Tensor, value: torch.Tensor,
+    def insert(self, target_rank: int, input_tokens: torch.Tensor,
+               roi: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                hidden: torch.Tensor) -> None:
+
+        logger.info(
+            "Inserting KV caches and hidden states for kv_group_rank %d, "
+            "target rank %d", self.kv_group_rank, target_rank)
 
         assert self.producer_buffer is not None, "Please initialize the "\
             "producer buffer before calling insert."
 
-        self.producer_buffer.insert(input_tokens, roi, key, value, hidden)
+        self.producer_buffer.insert(target_rank, input_tokens, roi, key, value,
+                                    hidden)
 
     def send_kv_caches_and_hidden_states(
         self,
@@ -170,6 +196,8 @@ class SimpleConnector(KVConnectorBase):
         num_heads = int(model_config.num_key_value_heads / self.tp_size)
         hidden_size = model_config.hidden_size
         num_attention_heads = model_config.num_attention_heads
+
+        num_heads_per_rank = num_heads // self.config.tensor_parallel_multiplier
 
         # Deepseek's MLA (Multi-head Latent Attention) uses two different
         # kv_cache shapes based on whether VLLM_MLA_DISABLE is set to 0.
@@ -207,31 +235,39 @@ class SimpleConnector(KVConnectorBase):
                 break
 
             current_tokens = input_tokens_tensor[start_pos:end_pos]
+            for target_rank_offset in range(
+                    self.config.tensor_parallel_multiplier):
+                keys, values = [], []
 
-            keys, values = [], []
+                for layer_id in range(start_layer, end_layer):
+                    kv_cache = kv_caches[layer_id - start_layer]
 
-            for layer_id in range(start_layer, end_layer):
-                kv_cache = kv_caches[layer_id - start_layer]
+                    if self.is_deepseek_mla and self.use_mla_opt:
+                        key_cache = kv_cache.reshape(-1, num_heads, head_size)
+                        value_cache = kv_cache.reshape(-1, num_heads,
+                                                       head_size)
+                    else:
+                        key_cache = kv_cache[0].reshape(
+                            -1, num_heads, head_size)
+                        value_cache = kv_cache[1].reshape(
+                            -1, num_heads, head_size)
 
-                if self.is_deepseek_mla and self.use_mla_opt:
-                    key_cache = kv_cache.reshape(-1, num_heads, head_size)
-                    value_cache = kv_cache.reshape(-1, num_heads, head_size)
-                else:
-                    key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
-                    value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
+                    current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
+                    head_start = target_rank_offset * num_heads_per_rank
+                    head_end = head_start + num_heads_per_rank
+                    keys.append(key_cache[current_slot_mapping,
+                                          head_start:head_end].unsqueeze(0))
+                    values.append(
+                        value_cache[current_slot_mapping,
+                                    head_start:head_end].unsqueeze(0))
 
-                current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
-
-                keys.append(key_cache[current_slot_mapping].unsqueeze(0))
-                values.append(value_cache[current_slot_mapping].unsqueeze(0))
-
-            keys = torch.cat(keys, dim=0)
-            values = torch.cat(values, dim=0)
-
-            self.insert(current_tokens,
-                        torch.ones_like(current_tokens,
-                                        dtype=bool), keys, values,
-                        hidden_or_intermediate_states[start_pos:end_pos])
+                keys = torch.cat(keys, dim=0)
+                values = torch.cat(values, dim=0)
+                target_rank = self.config.kv_producers_size + target_rank_offset
+                self.insert(target_rank, current_tokens,
+                            torch.ones_like(current_tokens,
+                                            dtype=bool), keys, values,
+                            hidden_or_intermediate_states[start_pos:end_pos])
 
         logger.debug("[rank%d]: KV send DONE.", torch.distributed.get_rank())
 
@@ -286,7 +322,12 @@ class SimpleConnector(KVConnectorBase):
             input_tokens_list.append(current_tokens)
             start_pos_list.append(start_pos)
 
-            ret = self.select(current_tokens,
+            source_rank = 0
+            logger.debug(
+                "kv group rank %d, tensor parallel multiplier %d, "
+                "source rank %d", self.kv_group_rank,
+                self.config.tensor_parallel_multiplier, source_rank)
+            ret = self.select(source_rank, current_tokens,
                               torch.ones_like(current_tokens, dtype=bool))
             if ret[0] is None:
                 # didn't find any match.
@@ -379,3 +420,12 @@ class SimpleConnector(KVConnectorBase):
             # MooncakePipe reuses data_pipe for signal_pipe, so we only have to
             # close the data_pipe.
             pass
+
+    def _get_kv_group_rank(self, kv_rank: int, rank: int,
+                           config: KVTransferConfig) -> int:
+        if kv_rank < self.config.kv_producers_size:
+            return kv_rank
+        kv_consumer_rank = kv_rank - config.kv_producers_size
+        return (config.kv_producers_size +
+                kv_consumer_rank * config.tensor_parallel_multiplier +
+                rank % config.tensor_parallel_multiplier)

@@ -36,15 +36,16 @@ async def handle_request():
         prefill_request = original_request_data.copy()
         # change max_tokens = 1 to let it only do prefill
         prefill_request['max_tokens'] = 1
-
+        print("Prefill begin")
         # finish prefill
         async for _ in forward_request('http://localhost:8100/v1/completions',
                                        prefill_request):
             continue
-
+        print("Prefill done")
         # return decode
         generator = forward_request('http://localhost:8200/v1/completions',
                                     original_request_data)
+        print("Decode begin")
         response = await make_response(generator)
         response.timeout = None
 
@@ -57,6 +58,19 @@ async def handle_request():
         print("Error occurred in disagg prefill proxy server")
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
+
+
+@app.route('/v1/models', methods=['GET'])
+async def forward_model_request():
+    async with aiohttp.ClientSession() as session:
+        headers = {
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"
+        }
+        async with session.get('http://localhost:8100/v1/models',
+                               headers=headers) as response:
+            if response.status == 200:
+                # Read the response from the upstream service
+                return await response.json()
 
 
 if __name__ == '__main__':
